@@ -330,7 +330,7 @@ void update_rq_clock(struct rq *rq)
 EXPORT_SYMBOL_GPL(update_rq_clock);
 
 static inline void
-rq_csd_init(struct rq *rq, call_single_data_t *csd, smp_call_func_t func)
+rq_csd_init(struct rq *rq, struct __call_single_data *csd, smp_call_func_t func)
 {
 	csd->flags = 0;
 	csd->func = func;
@@ -967,7 +967,7 @@ EXPORT_SYMBOL_GPL(sched_uclamp_used);
 
 static inline unsigned int uclamp_bucket_id(unsigned int clamp_value)
 {
-	return clamp_value / UCLAMP_BUCKET_DELTA;
+	return min_t(unsigned int, clamp_value / UCLAMP_BUCKET_DELTA, UCLAMP_BUCKETS - 1);
 }
 
 static inline unsigned int uclamp_none(enum uclamp_id clamp_id)
@@ -1449,17 +1449,24 @@ done:
 static int uclamp_validate(struct task_struct *p,
 			   const struct sched_attr *attr)
 {
-	unsigned int lower_bound = p->uclamp_req[UCLAMP_MIN].value;
-	unsigned int upper_bound = p->uclamp_req[UCLAMP_MAX].value;
+	int util_min = p->uclamp_req[UCLAMP_MIN].value;
+	int util_max = p->uclamp_req[UCLAMP_MAX].value;
 
-	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN)
-		lower_bound = attr->sched_util_min;
-	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX)
-		upper_bound = attr->sched_util_max;
+	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN) {
+		util_min = attr->sched_util_min;
 
-	if (lower_bound > upper_bound)
-		return -EINVAL;
-	if (upper_bound > SCHED_CAPACITY_SCALE)
+		if (util_min + 1 > SCHED_CAPACITY_SCALE + 1)
+			return -EINVAL;
+	}
+
+	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX) {
+		util_max = attr->sched_util_max;
+
+		if (util_max + 1 > SCHED_CAPACITY_SCALE + 1)
+			return -EINVAL;
+	}
+
+	if (util_min != -1 && util_max != -1 && util_min > util_max)
 		return -EINVAL;
 
 	/*
@@ -1474,20 +1481,41 @@ static int uclamp_validate(struct task_struct *p,
 	return 0;
 }
 
+static bool uclamp_reset(const struct sched_attr *attr,
+			 enum uclamp_id clamp_id,
+			 struct uclamp_se *uc_se)
+{
+	/* Reset on sched class change for a non user-defined clamp value. */
+	if (likely(!(attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)) &&
+	    !uc_se->user_defined)
+		return true;
+
+	/* Reset on sched_util_{min,max} == -1. */
+	if (clamp_id == UCLAMP_MIN &&
+	    attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN &&
+	    attr->sched_util_min == -1) {
+		return true;
+	}
+
+	if (clamp_id == UCLAMP_MAX &&
+	    attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX &&
+	    attr->sched_util_max == -1) {
+		return true;
+	}
+
+	return false;
+}
+
 static void __setscheduler_uclamp(struct task_struct *p,
 				  const struct sched_attr *attr)
 {
 	enum uclamp_id clamp_id;
 
-	/*
-	 * On scheduling class change, reset to default clamps for tasks
-	 * without a task-specific value.
-	 */
 	for_each_clamp_id(clamp_id) {
 		struct uclamp_se *uc_se = &p->uclamp_req[clamp_id];
+		unsigned int value;
 
-		/* Keep using defined clamps across class changes */
-		if (uc_se->user_defined)
+		if (!uclamp_reset(attr, clamp_id, uc_se))
 			continue;
 
 		/*
@@ -1495,21 +1523,25 @@ static void __setscheduler_uclamp(struct task_struct *p,
 		 * at runtime.
 		 */
 		if (unlikely(rt_task(p) && clamp_id == UCLAMP_MIN))
-			__uclamp_update_util_min_rt_default(p);
+			value = sysctl_sched_uclamp_util_min_rt_default;
 		else
-			uclamp_se_set(uc_se, uclamp_none(clamp_id), false);
+			value = uclamp_none(clamp_id);
+
+		uclamp_se_set(uc_se, value, false);
 
 	}
 
 	if (likely(!(attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)))
 		return;
 
-	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN) {
+	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN &&
+	    attr->sched_util_min != -1) {
 		uclamp_se_set(&p->uclamp_req[UCLAMP_MIN],
 			      attr->sched_util_min, true);
 	}
 
-	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX) {
+	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX &&
+	    attr->sched_util_max != -1) {
 		uclamp_se_set(&p->uclamp_req[UCLAMP_MAX],
 			      attr->sched_util_max, true);
 	}
@@ -1605,9 +1637,9 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	uclamp_rq_inc(rq, p);
-	p->sched_class->enqueue_task(rq, p, flags);
-
 	trace_android_rvh_enqueue_task(rq, p, flags);
+	p->sched_class->enqueue_task(rq, p, flags);
+	trace_android_rvh_after_enqueue_task(rq, p);
 }
 
 static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1621,9 +1653,9 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	uclamp_rq_dec(rq, p);
-	p->sched_class->dequeue_task(rq, p, flags);
-
 	trace_android_rvh_dequeue_task(rq, p, flags);
+	p->sched_class->dequeue_task(rq, p, flags);
+	trace_android_rvh_after_dequeue_task(rq, p);
 }
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1886,6 +1918,7 @@ void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_ma
 {
 	cpumask_copy(&p->cpus_mask, new_mask);
 	p->nr_cpus_allowed = cpumask_weight(new_mask);
+	trace_android_rvh_set_cpus_allowed_comm(p, new_mask);
 }
 
 void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
@@ -2058,7 +2091,15 @@ void force_compatible_cpus_allowed_ptr(struct task_struct *p)
 	cpumask_var_t new_mask;
 	const struct cpumask *override_mask = task_cpu_possible_mask(p);
 
-	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
+	alloc_cpumask_var(&new_mask, GFP_KERNEL);
+
+	/*
+	 * __migrate_task() can fail silently in the face of concurrent
+	 * offlining of the chosen destination CPU, so take the hotplug
+	 * lock to ensure that the migration succeeds.
+	 */
+	cpus_read_lock();
+	if (!cpumask_available(new_mask))
 		goto out_set_mask;
 
 	if (!restrict_cpus_allowed_ptr(p, new_mask, override_mask))
@@ -2078,8 +2119,9 @@ out_set_mask:
 				cpumask_pr_args(override_mask));
 	}
 
-	set_cpus_allowed_ptr(p, override_mask);
+	WARN_ON(set_cpus_allowed_ptr(p, override_mask));
 out_free_mask:
+	cpus_read_unlock();
 	free_cpumask_var(new_mask);
 }
 
@@ -6063,6 +6105,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	cpumask_var_t cpus_allowed, new_mask;
 	struct task_struct *p;
 	int retval;
+	int skip = 0;
 
 	rcu_read_lock();
 
@@ -6098,6 +6141,9 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 		rcu_read_unlock();
 	}
 
+	trace_android_vh_sched_setaffinity_early(p, in_mask, &skip);
+	if (skip)
+		goto out_free_new_mask;
 	retval = security_task_setscheduler(p);
 	if (retval)
 		goto out_free_new_mask;
@@ -6926,6 +6972,11 @@ static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf, bool force)
 	 * value of rq->clock[_task]
 	 */
 	update_rq_clock(rq);
+
+#ifdef CONFIG_SCHED_DEBUG
+	/* note the clock update in orf */
+	orf.clock_update_flags |= RQCF_UPDATED;
+#endif
 
 	for (;;) {
 		/*
@@ -7904,6 +7955,7 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	cpu_util_update_eff(css);
 #endif
 
+	trace_android_rvh_cpu_cgroup_online(css);
 	return 0;
 }
 

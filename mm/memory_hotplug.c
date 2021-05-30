@@ -596,8 +596,7 @@ void generic_online_page(struct page *page, unsigned int order)
 	 * so we should map it first. This is better than introducing a special
 	 * case in page freeing fast path.
 	 */
-	if (debug_pagealloc_enabled_static())
-		kernel_map_pages(page, 1 << order, 1);
+	debug_pagealloc_map_pages(page, 1 << order);
 	__free_pages_core(page, order);
 	totalram_pages_add(1UL << order);
 #ifdef CONFIG_HIGHMEM
@@ -1142,7 +1141,7 @@ int add_memory_subsection(int nid, u64 start, u64 size)
 
 	if (!IS_ALIGNED(start, SUBSECTION_SIZE) ||
 	    !IS_ALIGNED(size, SUBSECTION_SIZE)) {
-		pr_err("%s: start 0x%lx size 0x%lx not aligned to subsection size\n",
+		pr_err("%s: start 0x%llx size 0x%llx not aligned to subsection size\n",
 			   __func__, start, size);
 		return -EINVAL;
 	}
@@ -1162,7 +1161,7 @@ int add_memory_subsection(int nid, u64 start, u64 size)
 	if (ret) {
 		if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
 			memblock_remove(start, size);
-		pr_err("%s failed to add subsection start 0x%lx size 0x%lx\n",
+		pr_err("%s failed to add subsection start 0x%llx size 0x%llx\n",
 			   __func__, start, size);
 	}
 	mem_hotplug_done();
@@ -1319,6 +1318,8 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 	struct page *page, *head;
 	int ret = 0;
 	LIST_HEAD(source);
+	static DEFINE_RATELIMIT_STATE(migrate_rs, DEFAULT_RATELIMIT_INTERVAL,
+				      DEFAULT_RATELIMIT_BURST);
 
 	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
 		if (!pfn_valid(pfn))
@@ -1365,8 +1366,10 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 						    page_is_file_lru(page));
 
 		} else {
-			pr_warn("failed to isolate pfn %lx\n", pfn);
-			dump_page(page, "isolation failed");
+			if (__ratelimit(&migrate_rs)) {
+				pr_warn("failed to isolate pfn %lx\n", pfn);
+				dump_page(page, "isolation failed");
+			}
 		}
 		put_page(page);
 	}
@@ -1395,9 +1398,11 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 			(unsigned long)&mtc, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
 		if (ret) {
 			list_for_each_entry(page, &source, lru) {
-				pr_warn("migrating pfn %lx failed ret:%d ",
-				       page_to_pfn(page), ret);
-				dump_page(page, "migration failure");
+				if (__ratelimit(&migrate_rs)) {
+					pr_warn("migrating pfn %lx failed ret:%d\n",
+						page_to_pfn(page), ret);
+					dump_page(page, "migration failure");
+				}
 			}
 			putback_movable_pages(&source);
 		}
@@ -1852,7 +1857,7 @@ int remove_memory_subsection(int nid, u64 start, u64 size)
 
 	if (!IS_ALIGNED(start, SUBSECTION_SIZE) ||
 	    !IS_ALIGNED(size, SUBSECTION_SIZE)) {
-		pr_err("%s: start 0x%lx size 0x%lx not aligned to subsection size\n",
+		pr_err("%s: start 0x%llx size 0x%llx not aligned to subsection size\n",
 			   __func__, start, size);
 		return -EINVAL;
 	}
@@ -1861,7 +1866,7 @@ int remove_memory_subsection(int nid, u64 start, u64 size)
 
 	/* we cannot remove subsections that are invalid or online */
 	if(!__check_sections_offline(PHYS_PFN(start), size >> PAGE_SHIFT)) {
-		pr_err("%s: [%lx, %lx) sections are not offlined\n",
+		pr_err("%s: [%llx, %llx) sections are not offlined\n",
 			   __func__, start, start + size);
 		mem_hotplug_done();
 		return -EBUSY;
